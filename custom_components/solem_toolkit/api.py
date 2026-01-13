@@ -153,7 +153,7 @@ class SolemAPI:
 
     async def turn_on(self) -> None:
         """Turn on controller (enable watering)."""
-        command = struct.pack(">HBBBH", 0x3105, 0x12, 0xFF, 0x00, 0xFFFF)
+        command = struct.pack(">HBBBH", 0x3105, 0xA0, 0x00, 0x01, 0x0000)
         await self._write_and_commit(command)
 
     async def turn_off_permanent(self) -> None:
@@ -163,30 +163,32 @@ class SolemAPI:
 
     async def turn_off_x_days(self, days: int) -> None:
         """Disable watering for X days."""
-        days = max(0, min(days, 365))
-        command = struct.pack(">HBBBH", 0x3105, 0x15, 0x00, days, 0xFFFF)
+        days = max(0, min(days, 15))
+        command = struct.pack(">HBBBH", 0x3105, 0xC0, 0x00, days, 0x0000)
         await self._write_and_commit(command)
 
     async def sprinkle_station_x_for_y_minutes(self, station: int, minutes: int) -> None:
         """Manually water a station for Y minutes."""
         station = max(1, min(station, 16))
-        minutes = max(1, min(minutes, 240))
-        command = struct.pack(">HBBBBH", 0x3105, 0x22, station, 0x00, minutes, 0xFFFF)
+        minutes = max(1, min(minutes, 720))
+        seconds = minutes * 60
+        command = struct.pack(">HBBBH", 0x3105, 0x12, station, 0x00, seconds)
         await self._write_and_commit(command)
 
     async def sprinkle_all_stations_for_y_minutes(self, minutes: int) -> None:
         """Manually water all stations for Y minutes each."""
-        minutes = max(1, min(minutes, 240))
-        command = struct.pack(">HBBBH", 0x3105, 0x23, 0x00, minutes, 0xFFFF)
+        minutes = max(1, min(minutes, 720))
+        seconds = minutes * 60
+        command = struct.pack(">HBBBH", 0x3105, 0x11, 0x00, 0x00, seconds)
         await self._write_and_commit(command)
 
     async def run_program_x(self, program: int) -> None:
         """Run a controller program by id (1-3 on most devices)."""
         program = max(1, min(program, 3))
-        command = struct.pack(">HBBBH", 0x3105, 0x21, program, 0x00, 0xFFFF)
+        command = struct.pack(">HBBBH", 0x3105, 0x14, 0x00, program, 0x0000)
         await self._write_and_commit(command)
 
     async def stop_manual_sprinkle(self) -> None:
         """Stop any running manual watering session."""
-        command = struct.pack(">HBBBH", 0x3105, 0x24, 0x00, 0x00, 0xFFFF)
+        command = struct.pack(">HBBBH", 0x3105, 0x15, 0x00, 0xFF, 0x0000)
         await self._write_and_commit(command)
