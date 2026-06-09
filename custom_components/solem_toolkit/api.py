@@ -9,7 +9,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
-from typing import Optional
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
@@ -20,9 +21,10 @@ from bleak_retry_connector import (
 )
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from homeassistant.components.bluetooth import async_ble_device_from_address
 from homeassistant.core import HomeAssistant
 
-from .const import CHARACTERISTIC_UUID, DEFAULT_BLUETOOTH_TIMEOUT
+from .const import CHARACTERISTIC_UUID, DEFAULT_BLUETOOTH_TIMEOUT, NOTIFICATION_UUID
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -53,8 +55,15 @@ class SolemAPI:
 
     async def _resolve_ble_device(self) -> BLEDevice:
         """Resolve a BLEDevice for the configured MAC address."""
-        # First attempt: direct lookup by address (fast-path on most platforms)
-        ble_device: Optional[BLEDevice] = await BleakScanner.find_device_by_address(
+        # First attempt: prefer Home Assistant-managed scanners so Bluetooth proxies are supported
+        ble_device = async_ble_device_from_address(
+            self.hass, self.mac_address, connectable=True
+        )
+        if ble_device is not None:
+            return ble_device
+
+        # Second attempt: direct lookup by address (fast-path on most platforms)
+        ble_device = await BleakScanner.find_device_by_address(
             self.mac_address, timeout=5.0
         )
         if ble_device is not None:
@@ -135,21 +144,43 @@ class SolemAPI:
 
         await client.write_gatt_char(self.characteristic_uuid, payload, response=False)
 
+    @asynccontextmanager
+    async def _notification_session(self, client: BleakClient) -> AsyncIterator[None]:
+        """Subscribe to controller notifications for the duration of a command."""
+        try:
+            await client.start_notify(
+                NOTIFICATION_UUID,
+                lambda sender, data: _LOGGER.debug(
+                    "Notification from %s: %s", sender, data.hex()
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise APIConnectionError(
+                "Failed subscribing to controller notifications"
+            ) from exc
+
+        try:
+            yield
+        finally:
+            with suppress(Exception):
+                await client.stop_notify(NOTIFICATION_UUID)
+
     async def _write_and_commit(self, command: bytes) -> None:
         """Write a command then commit it (Solem protocol)."""
         client = await self._connect_client()
         try:
             if not client.is_connected:
                 raise APIConnectionError("Failed connecting!")
-            await self._write_with_auth_retry(client, command)
-            # Commit frame
-            commit = struct.pack(">BB", 0x3B, 0x00)
-            await self._write_with_auth_retry(client, commit)
+
+            async with self._notification_session(client):
+                await asyncio.sleep(2.0)
+                await self._write_with_auth_retry(client, command)
+                # Commit frame
+                commit = struct.pack(">BB", 0x3B, 0x00)
+                await self._write_with_auth_retry(client, commit)
         finally:
-            try:
+            with suppress(Exception):
                 await client.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
 
     async def turn_on(self) -> None:
         """Turn on controller (enable watering)."""
