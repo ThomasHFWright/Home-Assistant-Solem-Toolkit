@@ -1,5 +1,17 @@
 # Home Assistant Solem Toolkit Integration
 
+## Experimental station discovery
+
+The `experiment/station-discovery` branch adds `solem_toolkit.read_metadata`.
+It sends only identification (`0f00`) and output-name (`3500`) read requests,
+returning stored names, firmware, station count/source and raw response frames.
+
+Station count interpretation is experimental: recognized V5 identification
+profiles use the output-count byte, checked against the returned names. Unknown
+or conflicting profiles return no count so callers can retain manual settings.
+Unused output slots are never counted as stations. Incomplete name fragments
+raise an error. Pair with the Controller's matching experimental branch.
+
 ## Controller acknowledgement patch
 
 BLE commands now wait for a full status reply and final acknowledgement before

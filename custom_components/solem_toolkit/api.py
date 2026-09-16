@@ -28,6 +28,7 @@ from .const import CHARACTERISTIC_UUID, DEFAULT_BLUETOOTH_TIMEOUT, NOTIFICATION_
 _LOGGER = logging.getLogger(__name__)
 _COMMAND_LOCKS = "solem_toolkit_command_locks"
 _NOTIFICATION_SETTLE_DELAY = 2.0
+_METADATA_IDLE_TIMEOUT = 1.0
 
 
 class APIConnectionError(Exception):
@@ -259,7 +260,7 @@ class SolemAPI:
                         while True:
                             try:
                                 frame = await asyncio.wait_for(
-                                    notifications.get(), 1.0 if frames else self.bluetooth_timeout
+                                    notifications.get(), _METADATA_IDLE_TIMEOUT if frames else self.bluetooth_timeout
                                 )
                             except TimeoutError:
                                 if frames:
