@@ -57,6 +57,11 @@ async def test_metadata_reads_never_send_watering_or_commit(monkeypatch):
     monkeypatch.setattr(module, "_NOTIFICATION_SETTLE_DELAY", 0)
     monkeypatch.setattr(module, "_METADATA_IDLE_TIMEOUT", 0.001)
     client = SimpleNamespace(is_connected=True, stop_notify=AsyncMock(), disconnect=AsyncMock())
+    client.disconnect.side_effect = lambda: setattr(client, "is_connected", False)
+
+    async def connect():
+        client.is_connected = True
+        return client
 
     async def subscribe(uuid, callback):
         client.notify = lambda frame: callback(None, bytearray(frame))
@@ -74,7 +79,7 @@ async def test_metadata_reads_never_send_watering_or_commit(monkeypatch):
     client.start_notify = AsyncMock(side_effect=subscribe)
     client.write_gatt_char = AsyncMock(side_effect=write)
     api = module.SolemAPI(SimpleNamespace(data={}), "AA:BB:CC:DD:EE:FF")
-    api._connect_client = AsyncMock(return_value=client)
+    api._connect_client = AsyncMock(side_effect=connect)
     assert (await api.read_metadata())["station_count"] == 6
     assert [c.args[1] for c in client.write_gatt_char.await_args_list] == [b"\x0f\x00", b"\x35\x00"]
     assert client.disconnect.await_count == client.stop_notify.await_count == 2
@@ -100,6 +105,7 @@ async def test_unrelated_notifications_do_not_extend_metadata_wait(monkeypatch, 
     monkeypatch.setattr(module, "_NOTIFICATION_SETTLE_DELAY", 0)
     monkeypatch.setattr(module, "_METADATA_IDLE_TIMEOUT", 0.01)
     client = SimpleNamespace(is_connected=True, stop_notify=AsyncMock(), disconnect=AsyncMock())
+    client.disconnect.side_effect = lambda: setattr(client, "is_connected", False)
     expected = name_frames(1, "Garden")
 
     async def subscribe(uuid, callback):

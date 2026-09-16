@@ -10,7 +10,7 @@ import asyncio
 import logging
 import struct
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
@@ -29,6 +29,8 @@ _LOGGER = logging.getLogger(__name__)
 _COMMAND_LOCKS = "solem_toolkit_command_locks"
 _NOTIFICATION_SETTLE_DELAY = 2.0
 _METADATA_IDLE_TIMEOUT = 1.0
+_NOTIFICATION_CLEANUP_TIMEOUT = 2.0
+_DISCONNECT_TIMEOUT = 5.0
 
 
 class APIConnectionError(Exception):
@@ -103,10 +105,50 @@ class SolemAPI:
             except Exception as exc:  # noqa: BLE001
                 raise APIConnectionError("Unexpected BLE connection error") from exc
 
+    async def _cleanup_client(self, client: BleakClient, notifications: bool) -> None:
+        """Release the radio even if notification cleanup fails or hangs."""
+        if notifications and client.is_connected:
+            try:
+                async with asyncio.timeout(_NOTIFICATION_CLEANUP_TIMEOUT):
+                    await client.stop_notify(NOTIFICATION_UUID)
+            except Exception as exc:
+                _LOGGER.warning("%s - Notification cleanup failed: %r", self.mac_address, exc)
+
+        for attempt in range(2):
+            try:
+                async with asyncio.timeout(_DISCONNECT_TIMEOUT):
+                    await client.disconnect()
+                if not client.is_connected:
+                    _LOGGER.debug("%s - Bluetooth disconnected", self.mac_address)
+                    return
+                _LOGGER.warning("%s - Bluetooth still connected after disconnect", self.mac_address)
+            except Exception as exc:
+                _LOGGER.warning("%s - Disconnect attempt %s failed: %r", self.mac_address, attempt + 1, exc)
+        # Do not turn an acknowledged watering command into a retryable failure.
+        _LOGGER.error("%s - Bluetooth release could not be confirmed; phone access may be blocked", self.mac_address)
+
+    @asynccontextmanager
+    async def _connection(self, *, notifications: bool = False) -> AsyncIterator[BleakClient]:
+        """Hold the device lock until bounded cleanup finishes, even on cancellation."""
+        async with self._command_lock:
+            client = await self._connect_client()
+            try:
+                yield client
+            finally:
+                cleanup = asyncio.create_task(self._cleanup_client(client, notifications))
+                cancelled = False
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                cleanup.result()
+                if cancelled:
+                    raise asyncio.CancelledError
+
     async def list_characteristics(self) -> dict:
         """Return discovered services/characteristics (debug helper)."""
-        client = await self._connect_client()
-        try:
+        async with self._connection() as client:
             if not client.is_connected:
                 raise APIConnectionError("Failed connecting!")
 
@@ -134,11 +176,6 @@ class SolemAPI:
                     )
                 result[str(svc.uuid)] = chars
             return result
-        finally:
-            try:
-                await client.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
 
     async def _write(self, client: BleakClient, payload: bytes) -> None:
         """Write once: replaying an uncertain start can extend watering."""
@@ -166,11 +203,8 @@ class SolemAPI:
                 f"Failed subscribing to controller notifications: {exc}"
             ) from exc
 
-        try:
-            yield notifications
-        finally:
-            with suppress(Exception):
-                await client.stop_notify(NOTIFICATION_UUID)
+        # The enclosing connection owns cleanup, including failed subscriptions.
+        yield notifications
 
     async def _wait_for_response(self, notifications: asyncio.Queue[bytes]) -> dict:
         """Wait for a BL-IP status frame and its final acknowledgement.
@@ -195,8 +229,7 @@ class SolemAPI:
 
     async def _exchange(self, command: bytes | None) -> dict:
         """Keep the BLE session open until the controller replies, or fail."""
-        async with self._command_lock:
-            client = await self._connect_client()
+        async with self._connection(notifications=True) as client:
             try:
                 async with self._notification_session(client) as notifications:
                     await asyncio.sleep(_NOTIFICATION_SETTLE_DELAY)
@@ -223,9 +256,6 @@ class SolemAPI:
                 raise
             except Exception as exc:
                 raise APIConnectionError(f"Bluetooth command failed: {exc}") from exc
-            finally:
-                with suppress(Exception):
-                    await client.disconnect()
 
     async def _write_and_commit(self, command: bytes) -> None:
         """Write once, commit, and wait for the controller's response."""
@@ -247,8 +277,7 @@ class SolemAPI:
 
     async def _read_metadata_frames(self, request: bytes, prefix: bytes) -> list[bytes]:
         """Collect a read response until idle, bounded by the operation timeout."""
-        async with self._command_lock:
-            client = await self._connect_client()
+        async with self._connection(notifications=True) as client:
             try:
                 async with self._notification_session(client) as notifications:
                     await asyncio.sleep(_NOTIFICATION_SETTLE_DELAY)
@@ -273,9 +302,6 @@ class SolemAPI:
                                 idle_deadline = loop.time() + _METADATA_IDLE_TIMEOUT
             except Exception as exc:
                 raise APIConnectionError(f"Unable to read controller metadata: {exc}") from exc
-            finally:
-                with suppress(Exception):
-                    await client.disconnect()
 
     async def read_metadata(self) -> dict:
         """Read identification and station names without sending a commit."""

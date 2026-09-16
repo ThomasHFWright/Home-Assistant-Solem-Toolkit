@@ -1,5 +1,17 @@
 # Home Assistant Solem Toolkit Integration
 
+## Bluetooth connection cleanup
+
+The `fix/bluetooth-connection-cleanup` branch includes the station-discovery
+changes below. Commands, metadata reads, and connection checks share a device
+lock until cleanup completes. Notification cleanup has a two-second timeout;
+disconnect has a five-second timeout and one retry, with connection-state
+verification. Cancellation waits for cleanup, and release failures are logged
+without replaying an acknowledged watering command.
+
+This improves connection release for phone access. It does not add background
+Bluetooth polling or guarantee simultaneous connections with the phone app.
+
 ## Experimental station discovery
 
 The `experiment/station-discovery` branch adds `solem_toolkit.read_metadata`.

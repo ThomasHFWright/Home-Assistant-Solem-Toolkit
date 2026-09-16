@@ -24,6 +24,7 @@ def transport(monkeypatch):
         is_connected=True, stop_notify=AsyncMock(), disconnect=AsyncMock(),
         write_gatt_char=AsyncMock(), replies=(), commit_written=asyncio.Event(),
     )
+    client.disconnect.side_effect = lambda: setattr(client, "is_connected", False)
 
     async def subscribe(uuid, callback):
         client.notify = lambda frame: callback(None, bytearray(frame))
