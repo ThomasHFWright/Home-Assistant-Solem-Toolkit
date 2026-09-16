@@ -19,7 +19,6 @@ from bleak_retry_connector import (
     BleakOutOfConnectionSlotsError,
     establish_connection,
 )
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 from homeassistant.components.bluetooth import async_ble_device_from_address
 from homeassistant.core import HomeAssistant
@@ -27,6 +26,8 @@ from homeassistant.core import HomeAssistant
 from .const import CHARACTERISTIC_UUID, DEFAULT_BLUETOOTH_TIMEOUT, NOTIFICATION_UUID
 
 _LOGGER = logging.getLogger(__name__)
+_COMMAND_LOCKS = "solem_toolkit_command_locks"
+_NOTIFICATION_SETTLE_DELAY = 2.0
 
 
 class APIConnectionError(Exception):
@@ -48,6 +49,8 @@ class SolemAPI:
 
         self.characteristic_uuid: str = CHARACTERISTIC_UUID
         self._conn_lock = asyncio.Lock()
+        locks = hass.data.setdefault(_COMMAND_LOCKS, {})
+        self._command_lock = locks.setdefault((mac_address or "").upper(), asyncio.Lock())
 
     async def scan_bluetooth(self) -> list[BLEDevice]:
         """Return a list of discovered BLE devices."""
@@ -136,51 +139,110 @@ class SolemAPI:
             except Exception:  # noqa: BLE001
                 pass
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.4, min=0.4, max=2))
-    async def _write_with_auth_retry(self, client: BleakClient, payload: bytes) -> None:
-        """Write with a small retry loop (Solem can be picky right after connect)."""
+    async def _write(self, client: BleakClient, payload: bytes) -> None:
+        """Write once: replaying an uncertain start can extend watering."""
         if not client.is_connected:
             raise APIConnectionError("Client not connected")
 
         await client.write_gatt_char(self.characteristic_uuid, payload, response=False)
 
     @asynccontextmanager
-    async def _notification_session(self, client: BleakClient) -> AsyncIterator[None]:
+    async def _notification_session(
+        self, client: BleakClient
+    ) -> AsyncIterator[asyncio.Queue[bytes]]:
         """Subscribe to controller notifications for the duration of a command."""
+        notifications: asyncio.Queue[bytes] = asyncio.Queue()
+
+        def receive(sender, data):
+            frame = bytes(data)
+            _LOGGER.debug("%s - Notification: %s", self.mac_address, frame.hex())
+            notifications.put_nowait(frame)
+
         try:
-            await client.start_notify(
-                NOTIFICATION_UUID,
-                lambda sender, data: _LOGGER.debug(
-                    "Notification from %s: %s", sender, data.hex()
-                ),
-            )
+            await client.start_notify(NOTIFICATION_UUID, receive)
         except Exception as exc:  # noqa: BLE001
             raise APIConnectionError(
-                "Failed subscribing to controller notifications"
+                f"Failed subscribing to controller notifications: {exc}"
             ) from exc
 
         try:
-            yield
+            yield notifications
         finally:
             with suppress(Exception):
                 await client.stop_notify(NOTIFICATION_UUID)
 
-    async def _write_and_commit(self, command: bytes) -> None:
-        """Write a command then commit it (Solem protocol)."""
-        client = await self._connect_client()
-        try:
-            if not client.is_connected:
-                raise APIConnectionError("Failed connecting!")
+    async def _wait_for_response(self, notifications: asyncio.Queue[bytes]) -> dict:
+        """Wait for a BL-IP status frame and its final acknowledgement.
 
-            async with self._notification_session(client):
-                await asyncio.sleep(2.0)
-                await self._write_with_auth_retry(client, command)
-                # Commit frame
-                commit = struct.pack(">BB", 0x3B, 0x00)
-                await self._write_with_auth_retry(client, commit)
-        finally:
-            with suppress(Exception):
-                await client.disconnect()
+        V5 response families 0x32/0x3c use sequence 2 for full status,
+        1 for intermediate data, and 0 for completion. Other notifications
+        (including firmware metadata) must not satisfy a command.
+        """
+        status = None
+        while True:
+            frame = await notifications.get()
+            if len(frame) < 3 or frame[0] not in (0x32, 0x3C):
+                continue
+            if len(frame) >= 18 and frame[1] == 0x10 and frame[2] == 2 and frame[3] != 0x10:
+                status = frame
+            elif frame[2] == 0 and status is not None and frame[0] == status[0]:
+                return {
+                    "controller_on": bool(status[3] & 0x40),
+                    "active_station": status[9],
+                    "raw_notification": status.hex(),
+                }
+
+    async def _exchange(self, command: bytes | None) -> dict:
+        """Keep the BLE session open until the controller replies, or fail."""
+        async with self._command_lock:
+            client = await self._connect_client()
+            try:
+                async with self._notification_session(client) as notifications:
+                    await asyncio.sleep(_NOTIFICATION_SETTLE_DELAY)
+                    # Ignore any notifications received before this request.
+                    while not notifications.empty():
+                        notifications.get_nowait()
+                    if command is not None:
+                        _LOGGER.debug("%s - Sending command: %s", self.mac_address, command.hex())
+                        await self._write(client, command)
+                    # A bare commit is also the BL-IP status-poll request.
+                    await self._write(client, b"\x3b\x00")
+                    try:
+                        response = await asyncio.wait_for(
+                            self._wait_for_response(notifications), self.bluetooth_timeout
+                        )
+                    except TimeoutError as exc:
+                        raise APIConnectionError(
+                            "No complete controller acknowledgement after Bluetooth write; "
+                            "device state is unconfirmed"
+                        ) from exc
+                    _LOGGER.info("%s - Controller response: %s", self.mac_address, response)
+                    return response
+            except APIConnectionError:
+                raise
+            except Exception as exc:
+                raise APIConnectionError(f"Bluetooth command failed: {exc}") from exc
+            finally:
+                with suppress(Exception):
+                    await client.disconnect()
+
+    async def _write_and_commit(self, command: bytes) -> None:
+        """Write once, commit, and wait for the controller's response."""
+        response = await self._exchange(command)
+        expected_station = None
+        if command[2] == 0x12:
+            expected_station = command[3]
+        elif command[2] == 0x15:
+            expected_station = 0
+        if expected_station is not None and response["active_station"] != expected_station:
+            raise APIConnectionError(
+                f"Controller acknowledged the command but reports active station "
+                f"{response['active_station']}; expected {expected_station}"
+            )
+
+    async def read_status(self) -> dict:
+        """Read controller-reported state without issuing a watering command."""
+        return await self._exchange(None)
 
     async def turn_on(self) -> None:
         """Turn on controller (enable watering)."""
