@@ -256,11 +256,13 @@ class SolemAPI:
                         notifications.get_nowait()
                     await self._write(client, request)
                     frames = []
+                    loop = asyncio.get_running_loop()
+                    idle_deadline = loop.time() + self.bluetooth_timeout
                     async with asyncio.timeout(self.bluetooth_timeout):
                         while True:
                             try:
                                 frame = await asyncio.wait_for(
-                                    notifications.get(), _METADATA_IDLE_TIMEOUT if frames else self.bluetooth_timeout
+                                    notifications.get(), max(0, idle_deadline - loop.time())
                                 )
                             except TimeoutError:
                                 if frames:
@@ -268,6 +270,7 @@ class SolemAPI:
                                 raise
                             if frame.startswith(prefix):
                                 frames.append(frame)
+                                idle_deadline = loop.time() + _METADATA_IDLE_TIMEOUT
             except Exception as exc:
                 raise APIConnectionError(f"Unable to read controller metadata: {exc}") from exc
             finally:

@@ -78,3 +78,59 @@ async def test_metadata_reads_never_send_watering_or_commit(monkeypatch):
     assert (await api.read_metadata())["station_count"] == 6
     assert [c.args[1] for c in client.write_gatt_char.await_args_list] == [b"\x0f\x00", b"\x35\x00"]
     assert client.disconnect.await_count == client.stop_notify.await_count == 2
+
+
+@pytest.mark.parametrize("length", [2, 4, 19, 21])
+def test_malformed_name_frame_cannot_replace_a_complete_name(length):
+    frames = name_frames(1, "Existing garden")
+    # Also reject a bad duplicate instead of overwriting a valid fragment.
+    frames.append((frames[0] + b"x")[:length])
+    with pytest.raises(APIConnectionError, match="Incomplete"):
+        parse_metadata([], frames)
+
+
+@pytest.mark.parametrize("has_response", [True, False], ids=["complete-response", "noise-only"])
+async def test_unrelated_notifications_do_not_extend_metadata_wait(monkeypatch, has_response):
+    import asyncio
+    from contextlib import suppress
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from custom_components.solem_toolkit import api as module
+
+    monkeypatch.setattr(module, "_NOTIFICATION_SETTLE_DELAY", 0)
+    monkeypatch.setattr(module, "_METADATA_IDLE_TIMEOUT", 0.01)
+    client = SimpleNamespace(is_connected=True, stop_notify=AsyncMock(), disconnect=AsyncMock())
+    expected = name_frames(1, "Garden")
+
+    async def subscribe(uuid, callback):
+        client.notify = lambda frame: callback(None, bytearray(frame))
+
+    async def send_noise():
+        while True:
+            await asyncio.sleep(0.001)
+            client.notify(b"\x32unrelated")
+
+    async def write(*args, **kwargs):
+        if has_response:
+            for frame in expected:
+                client.notify(frame)
+        client.noise = asyncio.create_task(send_noise())
+
+    client.start_notify = AsyncMock(side_effect=subscribe)
+    client.write_gatt_char = AsyncMock(side_effect=write)
+    api = module.SolemAPI(SimpleNamespace(data={}), "AA:BB:CC:DD:EE:FF", bluetooth_timeout=0.1)
+    api._connect_client = AsyncMock(return_value=client)
+    try:
+        if has_response:
+            assert await api._read_metadata_frames(b"\x35\x00", b"\x36\x12") == expected
+        else:
+            with pytest.raises(APIConnectionError) as error:
+                await api._read_metadata_frames(b"\x35\x00", b"\x36\x12")
+            assert isinstance(error.value.__cause__, TimeoutError)
+    finally:
+        client.noise.cancel()
+        with suppress(asyncio.CancelledError):
+            await client.noise
+    client.disconnect.assert_awaited_once()
+    client.stop_notify.assert_awaited_once()
+    assert not api._command_lock.locked()

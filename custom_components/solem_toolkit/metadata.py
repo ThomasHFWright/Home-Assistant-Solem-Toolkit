@@ -7,7 +7,11 @@ def parse_metadata(identity: list[bytes], names: list[bytes]) -> dict:
     """Assemble names without mistaking unused output slots for real stations."""
     fragments: dict[int, dict[int, bytes]] = {}
     for frame in names:
-        if len(frame) < 4 or frame[:2] != b"\x36\x12" or frame[3] >= 12:
+        if frame[:2] != b"\x36\x12":
+            continue
+        if len(frame) != 20:
+            raise APIConnectionError("Incomplete station-name frame; existing names retained")
+        if frame[3] >= 12:
             continue
         fragments.setdefault(frame[3] + 1, {})[frame[2] & 1] = frame[4:20].split(b"\0", 1)[0]
     if not fragments or any(parts.keys() != {0, 1} for parts in fragments.values()):
