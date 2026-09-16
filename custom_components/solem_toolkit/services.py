@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
 
 from .api import APIConnectionError, SolemAPI
@@ -105,6 +105,13 @@ async def async_stop_manual_sprinkle(hass: HomeAssistant, call: ServiceCall) -> 
 
 
 def async_setup_services(hass: HomeAssistant) -> None:
+    async def _handle_read_status(call: ServiceCall) -> dict:
+        api = SolemAPI(hass, call.data.get("device_mac"), bluetooth_timeout=_get_timeout(call))
+        try:
+            return await api.read_status()
+        except APIConnectionError as exc:
+            raise HomeAssistantError(str(exc)) from exc
+
     async def _handle_list_characteristics(call: ServiceCall) -> None:
         await async_list_characteristics(hass, call)
 
@@ -130,6 +137,9 @@ def async_setup_services(hass: HomeAssistant) -> None:
         await async_stop_manual_sprinkle(hass, call)
 
     hass.services.async_register(DOMAIN, "list_characteristics", _handle_list_characteristics)
+    hass.services.async_register(
+        DOMAIN, "read_status", _handle_read_status, supports_response=SupportsResponse.OPTIONAL
+    )
     hass.services.async_register(DOMAIN, "turn_off_permanent", _handle_turn_off_permanent)
     hass.services.async_register(DOMAIN, "turn_off_x_days", _handle_turn_off_x_days)
     hass.services.async_register(DOMAIN, "turn_on", _handle_turn_on)
