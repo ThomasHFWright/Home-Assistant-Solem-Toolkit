@@ -1,5 +1,25 @@
 # Home Assistant Solem Toolkit Integration
 
+## Controller acknowledgement patch
+
+BLE commands now wait for a full status reply and final acknowledgement before
+disconnecting. Missing or unrelated replies fail; starts and stops also verify
+the reported active station. Command/status exchanges share a per-controller
+lock. Connection attempts may retry, but uncertain writes are never replayed.
+
+`solem_toolkit.read_status` accepts `device_mac` and optional `bluetooth_timeout`,
+and returns `controller_on`, `active_station`, and `raw_notification` without
+starting watering. These are controller snapshots, not flow measurements.
+
+Parsing follows the [BL-IP V5 protocol documentation](https://github.com/beelzetron/solem-blip-ble/blob/main/docs/ble_protocol.md)
+with unsupported response formats failing explicitly. Run the mocked regression
+suite on Python 3.14:
+
+```sh
+python -m pip install -r requirements-test.txt
+python -m pytest -q
+```
+
 [![hacs_badge](https://img.shields.io/badge/HACS-Default-41BDF5.svg)](https://github.com/hacs/integration)
 [![GitHub release](https://img.shields.io/github/release/hcraveiro/Home-Assistant-Solem-Toolkit.svg)](https://github.com/hcraveiro/Home-Assistant-Solem-Toolkit/releases/)
 

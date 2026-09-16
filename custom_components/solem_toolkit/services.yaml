@@ -1,3 +1,15 @@
+read_status:
+  name: Read controller status
+  description: "Read BL-IP controller-reported state and raw status without starting watering."
+  fields:
+    device_mac:
+      required: true
+      description: "Device's MAC address"
+      example: "00:11:22:33:44:55"
+    bluetooth_timeout:
+      description: "Connection and response timeout in seconds"
+      example: 15
+
 list_characteristics:
   description: "List characteristics of device"
   fields:
