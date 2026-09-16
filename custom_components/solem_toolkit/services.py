@@ -105,6 +105,13 @@ async def async_stop_manual_sprinkle(hass: HomeAssistant, call: ServiceCall) -> 
 
 
 def async_setup_services(hass: HomeAssistant) -> None:
+    async def _handle_read_metadata(call: ServiceCall) -> dict:
+        api = SolemAPI(hass, call.data.get("device_mac"), bluetooth_timeout=_get_timeout(call))
+        try:
+            return await api.read_metadata()
+        except APIConnectionError as exc:
+            raise HomeAssistantError(str(exc)) from exc
+
     async def _handle_read_status(call: ServiceCall) -> dict:
         api = SolemAPI(hass, call.data.get("device_mac"), bluetooth_timeout=_get_timeout(call))
         try:
@@ -136,6 +143,9 @@ def async_setup_services(hass: HomeAssistant) -> None:
     async def _handle_stop_manual(call: ServiceCall) -> None:
         await async_stop_manual_sprinkle(hass, call)
 
+    hass.services.async_register(
+        DOMAIN, "read_metadata", _handle_read_metadata, supports_response=SupportsResponse.OPTIONAL
+    )
     hass.services.async_register(DOMAIN, "list_characteristics", _handle_list_characteristics)
     hass.services.async_register(
         DOMAIN, "read_status", _handle_read_status, supports_response=SupportsResponse.OPTIONAL

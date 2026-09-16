@@ -244,6 +244,43 @@ class SolemAPI:
         """Read controller-reported state without issuing a watering command."""
         return await self._exchange(None)
 
+    async def _read_metadata_frames(self, request: bytes, prefix: bytes) -> list[bytes]:
+        """Collect a read response until idle, bounded by the operation timeout."""
+        async with self._command_lock:
+            client = await self._connect_client()
+            try:
+                async with self._notification_session(client) as notifications:
+                    await asyncio.sleep(_NOTIFICATION_SETTLE_DELAY)
+                    while not notifications.empty():
+                        notifications.get_nowait()
+                    await self._write(client, request)
+                    frames = []
+                    async with asyncio.timeout(self.bluetooth_timeout):
+                        while True:
+                            try:
+                                frame = await asyncio.wait_for(
+                                    notifications.get(), 1.0 if frames else self.bluetooth_timeout
+                                )
+                            except TimeoutError:
+                                if frames:
+                                    return frames
+                                raise
+                            if frame.startswith(prefix):
+                                frames.append(frame)
+            except Exception as exc:
+                raise APIConnectionError(f"Unable to read controller metadata: {exc}") from exc
+            finally:
+                with suppress(Exception):
+                    await client.disconnect()
+
+    async def read_metadata(self) -> dict:
+        """Read identification and station names without sending a commit."""
+        from .metadata import parse_metadata
+
+        identity = await self._read_metadata_frames(b"\x0f\x00", b"\x10")
+        names = await self._read_metadata_frames(b"\x35\x00", b"\x36\x12")
+        return parse_metadata(identity, names)
+
     async def turn_on(self) -> None:
         """Turn on controller (enable watering)."""
         command = struct.pack(">HBBBH", 0x3105, 0xA0, 0x00, 0x01, 0x0000)

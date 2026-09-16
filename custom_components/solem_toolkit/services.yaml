@@ -1,3 +1,15 @@
+read_metadata:
+  name: Read station details
+  description: "Read controller identification and stored station names (experimental)."
+  fields:
+    device_mac:
+      required: true
+      description: "Device MAC address"
+      example: "00:11:22:33:44:55"
+    bluetooth_timeout:
+      description: "Response timeout in seconds"
+      example: 15
+
 read_status:
   name: Read controller status
   description: "Read BL-IP controller-reported state and raw status without starting watering."
