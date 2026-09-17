@@ -4,9 +4,10 @@
 
 The `fix/bluetooth-connection-cleanup` branch includes the station-discovery
 changes below. Commands, metadata reads, and connection checks share a device
-lock until cleanup completes. Notification cleanup has a two-second timeout;
-disconnect has a five-second timeout and one retry, with connection-state
-verification. Cancellation waits for cleanup, and release failures are logged
+lock until cleanup completes. Disconnect also stops notifications and has a
+five-second timeout and one retry, with connection-state verification. Once a
+client is acquired, cancellation waits for cleanup. Connection establishment
+remains managed by Bleak and its retry helper. Release failures are logged
 without replaying an acknowledged watering command.
 
 This improves connection release for phone access. It does not add background

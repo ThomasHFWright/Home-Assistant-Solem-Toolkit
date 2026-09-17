@@ -29,7 +29,6 @@ _LOGGER = logging.getLogger(__name__)
 _COMMAND_LOCKS = "solem_toolkit_command_locks"
 _NOTIFICATION_SETTLE_DELAY = 2.0
 _METADATA_IDLE_TIMEOUT = 1.0
-_NOTIFICATION_CLEANUP_TIMEOUT = 2.0
 _DISCONNECT_TIMEOUT = 5.0
 
 
@@ -51,7 +50,6 @@ class SolemAPI:
         self.bluetooth_timeout = bluetooth_timeout
 
         self.characteristic_uuid: str = CHARACTERISTIC_UUID
-        self._conn_lock = asyncio.Lock()
         locks = hass.data.setdefault(_COMMAND_LOCKS, {})
         self._command_lock = locks.setdefault((mac_address or "").upper(), asyncio.Lock())
 
@@ -85,35 +83,27 @@ class SolemAPI:
 
     async def _connect_client(self) -> BleakClient:
         """Establish a robust connection using bleak-retry-connector."""
-        async with self._conn_lock:
-            ble_device = await self._resolve_ble_device()
-            try:
-                client = await establish_connection(
-                    BleakClient,
-                    ble_device,
-                    name=f"Solem - {self.mac_address}",
-                    timeout=self.bluetooth_timeout,
-                    max_attempts=3,
-                )
-                return client
-            except BleakOutOfConnectionSlotsError as exc:
-                raise APIConnectionError(
-                    "Bluetooth adapter/proxy out of connection slots or device busy/unreachable"
-                ) from exc
-            except (BleakDBusError, TimeoutError, OSError) as exc:
-                raise APIConnectionError("Timeout connecting to device") from exc
-            except Exception as exc:  # noqa: BLE001
-                raise APIConnectionError("Unexpected BLE connection error") from exc
+        ble_device = await self._resolve_ble_device()
+        try:
+            client = await establish_connection(
+                BleakClient,
+                ble_device,
+                name=f"Solem - {self.mac_address}",
+                timeout=self.bluetooth_timeout,
+                max_attempts=3,
+            )
+            return client
+        except BleakOutOfConnectionSlotsError as exc:
+            raise APIConnectionError(
+                "Bluetooth adapter/proxy out of connection slots or device busy/unreachable"
+            ) from exc
+        except (BleakDBusError, TimeoutError, OSError) as exc:
+            raise APIConnectionError("Timeout connecting to device") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise APIConnectionError("Unexpected BLE connection error") from exc
 
-    async def _cleanup_client(self, client: BleakClient, notifications: bool) -> None:
-        """Release the radio even if notification cleanup fails or hangs."""
-        if notifications and client.is_connected:
-            try:
-                async with asyncio.timeout(_NOTIFICATION_CLEANUP_TIMEOUT):
-                    await client.stop_notify(NOTIFICATION_UUID)
-            except Exception as exc:
-                _LOGGER.warning("%s - Notification cleanup failed: %r", self.mac_address, exc)
-
+    async def _cleanup_client(self, client: BleakClient) -> None:
+        """Disconnect also stops notifications; avoid a separate failure-prone step."""
         for attempt in range(2):
             try:
                 async with asyncio.timeout(_DISCONNECT_TIMEOUT):
@@ -128,14 +118,14 @@ class SolemAPI:
         _LOGGER.error("%s - Bluetooth release could not be confirmed; phone access may be blocked", self.mac_address)
 
     @asynccontextmanager
-    async def _connection(self, *, notifications: bool = False) -> AsyncIterator[BleakClient]:
+    async def _connection(self) -> AsyncIterator[BleakClient]:
         """Hold the device lock until bounded cleanup finishes, even on cancellation."""
         async with self._command_lock:
             client = await self._connect_client()
             try:
                 yield client
             finally:
-                cleanup = asyncio.create_task(self._cleanup_client(client, notifications))
+                cleanup = asyncio.create_task(self._cleanup_client(client))
                 cancelled = False
                 while not cleanup.done():
                     try:
@@ -184,10 +174,9 @@ class SolemAPI:
 
         await client.write_gatt_char(self.characteristic_uuid, payload, response=False)
 
-    @asynccontextmanager
-    async def _notification_session(
+    async def _subscribe(
         self, client: BleakClient
-    ) -> AsyncIterator[asyncio.Queue[bytes]]:
+    ) -> asyncio.Queue[bytes]:
         """Subscribe to controller notifications for the duration of a command."""
         notifications: asyncio.Queue[bytes] = asyncio.Queue()
 
@@ -204,7 +193,7 @@ class SolemAPI:
             ) from exc
 
         # The enclosing connection owns cleanup, including failed subscriptions.
-        yield notifications
+        return notifications
 
     async def _wait_for_response(self, notifications: asyncio.Queue[bytes]) -> dict:
         """Wait for a BL-IP status frame and its final acknowledgement.
@@ -229,29 +218,29 @@ class SolemAPI:
 
     async def _exchange(self, command: bytes | None) -> dict:
         """Keep the BLE session open until the controller replies, or fail."""
-        async with self._connection(notifications=True) as client:
+        async with self._connection() as client:
             try:
-                async with self._notification_session(client) as notifications:
-                    await asyncio.sleep(_NOTIFICATION_SETTLE_DELAY)
-                    # Ignore any notifications received before this request.
-                    while not notifications.empty():
-                        notifications.get_nowait()
-                    if command is not None:
-                        _LOGGER.debug("%s - Sending command: %s", self.mac_address, command.hex())
-                        await self._write(client, command)
-                    # A bare commit is also the BL-IP status-poll request.
-                    await self._write(client, b"\x3b\x00")
-                    try:
-                        response = await asyncio.wait_for(
-                            self._wait_for_response(notifications), self.bluetooth_timeout
-                        )
-                    except TimeoutError as exc:
-                        raise APIConnectionError(
-                            "No complete controller acknowledgement after Bluetooth write; "
-                            "device state is unconfirmed"
-                        ) from exc
-                    _LOGGER.info("%s - Controller response: %s", self.mac_address, response)
-                    return response
+                notifications = await self._subscribe(client)
+                await asyncio.sleep(_NOTIFICATION_SETTLE_DELAY)
+                # Ignore any notifications received before this request.
+                while not notifications.empty():
+                    notifications.get_nowait()
+                if command is not None:
+                    _LOGGER.debug("%s - Sending command: %s", self.mac_address, command.hex())
+                    await self._write(client, command)
+                # A bare commit is also the BL-IP status-poll request.
+                await self._write(client, b"\x3b\x00")
+                try:
+                    response = await asyncio.wait_for(
+                        self._wait_for_response(notifications), self.bluetooth_timeout
+                    )
+                except TimeoutError as exc:
+                    raise APIConnectionError(
+                        "No complete controller acknowledgement after Bluetooth write; "
+                        "device state is unconfirmed"
+                    ) from exc
+                _LOGGER.info("%s - Controller response: %s", self.mac_address, response)
+                return response
             except APIConnectionError:
                 raise
             except Exception as exc:
@@ -277,29 +266,29 @@ class SolemAPI:
 
     async def _read_metadata_frames(self, request: bytes, prefix: bytes) -> list[bytes]:
         """Collect a read response until idle, bounded by the operation timeout."""
-        async with self._connection(notifications=True) as client:
+        async with self._connection() as client:
             try:
-                async with self._notification_session(client) as notifications:
-                    await asyncio.sleep(_NOTIFICATION_SETTLE_DELAY)
-                    while not notifications.empty():
-                        notifications.get_nowait()
-                    await self._write(client, request)
-                    frames = []
-                    loop = asyncio.get_running_loop()
-                    idle_deadline = loop.time() + self.bluetooth_timeout
-                    async with asyncio.timeout(self.bluetooth_timeout):
-                        while True:
-                            try:
-                                frame = await asyncio.wait_for(
-                                    notifications.get(), max(0, idle_deadline - loop.time())
-                                )
-                            except TimeoutError:
-                                if frames:
-                                    return frames
-                                raise
-                            if frame.startswith(prefix):
-                                frames.append(frame)
-                                idle_deadline = loop.time() + _METADATA_IDLE_TIMEOUT
+                notifications = await self._subscribe(client)
+                await asyncio.sleep(_NOTIFICATION_SETTLE_DELAY)
+                while not notifications.empty():
+                    notifications.get_nowait()
+                await self._write(client, request)
+                frames = []
+                loop = asyncio.get_running_loop()
+                idle_deadline = loop.time() + self.bluetooth_timeout
+                async with asyncio.timeout(self.bluetooth_timeout):
+                    while True:
+                        try:
+                            frame = await asyncio.wait_for(
+                                notifications.get(), max(0, idle_deadline - loop.time())
+                            )
+                        except TimeoutError:
+                            if frames:
+                                return frames
+                            raise
+                        if frame.startswith(prefix):
+                            frames.append(frame)
+                            idle_deadline = loop.time() + _METADATA_IDLE_TIMEOUT
             except Exception as exc:
                 raise APIConnectionError(f"Unable to read controller metadata: {exc}") from exc
 

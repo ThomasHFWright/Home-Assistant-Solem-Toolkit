@@ -57,7 +57,7 @@ async def test_start_waits_for_full_response_before_disconnect(transport):
     assert [call.args[1] for call in client.write_gatt_char.await_args_list] == [
         bytes.fromhex("3105120100003c"), bytes.fromhex("3b00")
     ]
-    client.stop_notify.assert_awaited_once()
+    client.stop_notify.assert_not_awaited()
     client.disconnect.assert_awaited_once()
 
 
@@ -71,7 +71,7 @@ async def test_missing_partial_unrelated_or_mismatched_reply_fails(transport, fr
     with pytest.raises(APIConnectionError, match="acknowledgement"):
         await api.sprinkle_station_x_for_y_minutes(1, 1)
     assert client.write_gatt_char.await_count == 2
-    client.stop_notify.assert_awaited_once()
+    client.stop_notify.assert_not_awaited()
     client.disconnect.assert_awaited_once()
 
 

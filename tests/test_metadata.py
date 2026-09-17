@@ -82,7 +82,8 @@ async def test_metadata_reads_never_send_watering_or_commit(monkeypatch):
     api._connect_client = AsyncMock(side_effect=connect)
     assert (await api.read_metadata())["station_count"] == 6
     assert [c.args[1] for c in client.write_gatt_char.await_args_list] == [b"\x0f\x00", b"\x35\x00"]
-    assert client.disconnect.await_count == client.stop_notify.await_count == 2
+    assert client.disconnect.await_count == 2
+    client.stop_notify.assert_not_awaited()
 
 
 @pytest.mark.parametrize("length", [2, 4, 19, 21])
@@ -138,5 +139,5 @@ async def test_unrelated_notifications_do_not_extend_metadata_wait(monkeypatch, 
         with suppress(asyncio.CancelledError):
             await client.noise
     client.disconnect.assert_awaited_once()
-    client.stop_notify.assert_awaited_once()
+    client.stop_notify.assert_not_awaited()
     assert not api._command_lock.locked()

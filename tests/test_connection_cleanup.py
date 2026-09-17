@@ -13,7 +13,6 @@ from custom_components.solem_toolkit.api import APIConnectionError, SolemAPI
 @pytest.fixture
 def transport(monkeypatch):
     monkeypatch.setattr(module, "_NOTIFICATION_SETTLE_DELAY", 0)
-    monkeypatch.setattr(module, "_NOTIFICATION_CLEANUP_TIMEOUT", 0.01)
     monkeypatch.setattr(module, "_DISCONNECT_TIMEOUT", 0.01)
     client = SimpleNamespace(is_connected=True, services=[], start_notify=AsyncMock(),
                              stop_notify=AsyncMock(), write_gatt_char=AsyncMock())
@@ -27,16 +26,13 @@ async def hang(*args):
     await asyncio.Event().wait()
 
 
-@pytest.mark.parametrize("failure", [hang, OSError("unsubscribe failed")])
-async def test_notification_cleanup_cannot_prevent_disconnect(transport, failure, caplog):
+async def test_disconnect_preserves_original_write_failure(transport):
     api, client = transport
-    client.stop_notify.side_effect = failure
     client.write_gatt_char.side_effect = OSError("original write failure")
     with pytest.raises(APIConnectionError, match="original write failure"):
-        await asyncio.wait_for(api.read_status(), 1)
+        await api.read_status()
     assert not client.is_connected
     client.disconnect.assert_awaited_once()
-    assert "Notification cleanup failed" in caplog.text
     assert not api._command_lock.locked()
 
 
@@ -143,21 +139,38 @@ async def test_cancellation_during_subscription_still_releases_connection(transp
     assert not api._command_lock.locked()
 
 
-async def test_cancellation_during_notification_cleanup_still_disconnects(transport):
+async def test_disconnect_does_not_depend_on_explicit_notification_shutdown(transport):
     api, client = transport
-    entered = asyncio.Event()
-    api._wait_for_response = AsyncMock(return_value={"active_station": 0})
-
-    async def unsubscribe(*args):
-        entered.set()
-        await hang()
-
-    client.stop_notify.side_effect = unsubscribe
-    task = asyncio.create_task(api.read_status())
-    await asyncio.wait_for(entered.wait(), 1)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 1)
+    api._wait_for_response = AsyncMock(return_value={"active_station": 1})
+    client.stop_notify.side_effect = asyncio.CancelledError
+    await api.sprinkle_station_x_for_y_minutes(1, 1)
     assert not client.is_connected
     client.disconnect.assert_awaited_once()
+    assert client.write_gatt_char.await_count == 2
+
+
+async def test_connection_state_error_does_not_skip_disconnect_or_mask_reply(transport, caplog):
+    from unittest.mock import Mock, PropertyMock
+
+    api, _ = transport
+    client = Mock(disconnect=AsyncMock(), start_notify=AsyncMock())
+    type(client).is_connected = PropertyMock(side_effect=OSError("state unavailable"))
+    api._connect_client.return_value = client
+    api._write = AsyncMock()
+    api._wait_for_response = AsyncMock(return_value={"active_station": 1})
+    await api.sprinkle_station_x_for_y_minutes(1, 1)
+    assert client.disconnect.await_count == 2
+    assert "Bluetooth release could not be confirmed" in caplog.text
+    assert api._write.await_count == 2
+    assert not api._command_lock.locked()
+
+
+@pytest.mark.parametrize("failure", [APIConnectionError("connect failed"), asyncio.CancelledError()])
+async def test_failed_acquisition_releases_lock_without_a_client(transport, failure):
+    api, client = transport
+    api._connect_client.side_effect = failure
+    with pytest.raises(type(failure)):
+        await api.read_status()
+    client.disconnect.assert_not_awaited()
+    client.start_notify.assert_not_awaited()
     assert not api._command_lock.locked()
